@@ -339,7 +339,7 @@ Rules:
 4. If the page does not state """ + question + """, return value 0, unit "OTHER",
    and an empty quote. Never invent a value.
 
-<source url=\\"""" + url + """\">
+<source>
 """ + page + """
 </source>"""
 
