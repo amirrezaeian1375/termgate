@@ -34,11 +34,14 @@ Why this is not a prompt wrapper
 * The model is not asked whether the requirement is met. It is not told the
   threshold at all. It cannot influence the verdict except by misreading a number
   that must then appear in the sentence it cites.
-* Three independent checks stand between a claim and storage: the sentence must
+* Four independent checks stand between a claim and storage. The sentence must
   exist on the validator's own fetch of the page, it must print the number that
-  was stored next to it, and it must contain a keyword for the field being read.
+  was stored next to it, it must contain a keyword for the field being read, and
+  it must print the unit that was stored next to it.
 * The validator then re-runs the whole pipeline and requires an identical
-  verdict, an identical gap, and an identical reason for a failure.
+  verdict, an identical gap, an identical unit, and an identical reason for a
+  failure. The validator's own reading has to be readable and settled on its own
+  terms before it will accept anyone else's.
 * Units are never converted. A page that says "one month" against a threshold in
   days yields UNCOMPARABLE rather than a guessed 30. Refusing to compare is a
   design decision, not a gap.
@@ -92,6 +95,14 @@ MAX_LIST = 60
 MIN_THRESHOLD = 1
 MAX_THRESHOLD = 10000
 MAX_VALUE = 10000
+
+# The words a sentence must print for a stored unit to count as supported by it.
+# A sentence about a period in months never says "days", and the other way round,
+# so this is a deterministic test over page text and not another model call.
+UNIT_WORDS = {
+    U_DAYS: ("day", "days"),
+    U_MONTHS: ("month", "months"),
+}
 
 # A finite, named set of policy fields. Each one carries the words that must be
 # present in the citing sentence, so the "is this sentence about the right thing"
@@ -235,8 +246,33 @@ def _quote_supports(quote: str, value: int, topic: str) -> bool:
     return str(int(value)) in _num_tokens(_norm(quote))
 
 
-# ------------------------------------------------------------------ reading
+def _unit_ok(quote: str, unit: str) -> bool:
+    """The sentence must print the unit that was stored beside it.
 
+    Without this, a leader can store a value read in days with a unit of months
+    and pair it with a real sentence that never mentions months. The verdict
+    would then rest on a unit its own evidence contradicts. This check is text
+    over the quote, so every validator reaches the same answer.
+    """
+    words = UNIT_WORDS.get(unit, ())
+    if len(words) == 0:
+        return False
+    text = _norm(quote)
+    for word in words:
+        tokens = text.split()
+        for token in tokens:
+            if token == word:
+                return True
+            if token.startswith(word) and len(token) <= len(word) + 3:
+                # "days", "days'", "months," and similar punctuation tails, but
+                # not a different word that merely starts the same way.
+                tail = token[len(word):]
+                if tail.strip("'-.,;:()") == "":
+                    return True
+    return False
+
+
+# ------------------------------------------------------------------ reading
 
 WINDOW_CHARS = 4000
 WINDOW_STEP = 250
@@ -381,11 +417,49 @@ def _decide(url: str, excerpt: str, topic: str, page: str, op: str, threshold: i
     """Read, verify the evidence, then compare. Leader and validator both run this."""
     found = _read_value(url, excerpt, topic)
     if not found["ok"]:
-        return {"state": S_UNRESOLVED, "verdict": "", "reason": found["reason"], "gap": 0}
+        return {
+            "state": S_UNRESOLVED,
+            "verdict": "",
+            "reason": found["reason"],
+            "gap": 0,
+            "value": 0,
+            "unit": U_UNKNOWN,
+            "quote": "",
+        }
     if not _is_grounded(page, found["quote"]):
-        return {"state": S_UNRESOLVED, "verdict": "", "reason": "QUOTE_NOT_GROUNDED", "gap": 0}
+        return {
+            "state": S_UNRESOLVED,
+            "verdict": "",
+            "reason": "QUOTE_NOT_GROUNDED",
+            "gap": 0,
+            "value": 0,
+            "unit": U_UNKNOWN,
+            "quote": "",
+        }
     if not _quote_supports(found["quote"], found["value"], topic):
-        return {"state": S_UNRESOLVED, "verdict": "", "reason": "QUOTE_NOT_SUPPORTING", "gap": 0}
+        return {
+            "state": S_UNRESOLVED,
+            "verdict": "",
+            "reason": "QUOTE_NOT_SUPPORTING",
+            "gap": 0,
+            "value": 0,
+            "unit": U_UNKNOWN,
+            "quote": "",
+        }
+    if not _unit_ok(found["quote"], found["unit"]):
+        # A stored unit that the citing sentence never prints is not evidence,
+        # so the reading is refused instead of being stored next to a verdict it
+        # cannot justify. This applies to UNKNOWN too: a period counted in
+        # business days has to say so in the sentence that was quoted.
+        return {
+            "state": S_UNRESOLVED,
+            "verdict": "",
+            "reason": "QUOTE_NOT_SUPPORTING",
+            "gap": 0,
+            "value": 0,
+            "unit": U_UNKNOWN,
+            "quote": "",
+        }
 
     outcome = compute_verdict(op, threshold, found["value"], found["unit"], want_unit)
     return {
@@ -400,7 +474,15 @@ def _decide(url: str, excerpt: str, topic: str, page: str, op: str, threshold: i
 
 
 def _same_verdict(claimed: dict, own: dict) -> bool:
-    """Equal verdicts, equal gaps, and for a failure, equal reasons."""
+    """Equal state, verdict, reason, gap, value, and unit.
+
+    The unit is part of the claim, not decoration. It is the input that decided
+    whether the comparison could happen at all: a value stored as MONTHS against
+    a threshold in DAYS settles as UNCOMPARABLE, and a value stored as DAYS
+    settles on the arithmetic. A leader that keeps the numbers and changes the
+    unit is claiming a verdict its own reading does not support, so the unit is
+    compared here exactly like the gap.
+    """
     if claimed.get("state") != own.get("state"):
         return False
     if own.get("state") != S_SETTLED:
@@ -408,6 +490,8 @@ def _same_verdict(claimed: dict, own: dict) -> bool:
     if claimed.get("verdict") != own.get("verdict"):
         return False
     if claimed.get("reason") != own.get("reason"):
+        return False
+    if _as_text(claimed.get("unit")) != own.get("unit"):
         return False
     if int(claimed.get("gap", 0)) != int(own.get("gap", 0)):
         return False
@@ -419,6 +503,8 @@ def _same_verdict(claimed: dict, own: dict) -> bool:
 @allow_storage
 @dataclass
 class Check:
+    """One page, one field, one threshold, answered as a verdict."""
+
     owner: Address
     source_url: str
     topic: str
@@ -537,20 +623,32 @@ class TermGate(gl.Contract):
                 return False
             excerpt = _window(page, MAX_PAGE_CHARS, topic)
 
-            # A settled answer spends its evidence twice: the sentence must be in
-            # this validator's own copy of the page, and it must print the number
-            # the leader stored beside it. A borrowed sentence cannot carry a
-            # number it never states.
-            if claimed.get("state") == S_SETTLED:
+            claimed_state = _as_text(claimed.get("state"))
+            if claimed_state == S_SETTLED:
                 quote = _as_text(claimed.get("quote"))
                 value = claimed.get("value")
+                unit = _as_text(claimed.get("unit"))
                 if not isinstance(value, int) or isinstance(value, bool):
                     return False
+                # A unit outside the published vocabulary is not a claim this
+                # contract can check, so it cannot be accepted.
+                if unit not in UNITS:
+                    return False
+                # A settled answer spends its evidence four times: the sentence
+                # must be in this validator's own copy of the page, it must
+                # print the number stored beside it, it must talk about the
+                # field, and it must print the unit stored beside it.
                 if not _is_grounded(page, quote):
                     return False
                 if not _quote_supports(quote, value, topic):
                     return False
+                if not _unit_ok(quote, unit):
+                    return False
 
+            # The validator re-runs the whole pipeline on its own fetch. Its own
+            # reading has to be settled for the leader's settled claim to stand:
+            # if this validator cannot read the page, it cannot certify that
+            # anyone else read it correctly.
             own = _decide(url, excerpt, topic, page, op, threshold, want_unit)
             return _same_verdict(claimed, own)
 
@@ -603,35 +701,29 @@ class TermGate(gl.Contract):
 
     @gl.public.view
     def verdict(self, check_id: str) -> str:
-        c = self._get(check_id)
-        if c.state != S_SETTLED:
-            return ""
-        return c.verdict
+        return self._get(check_id).verdict
 
     @gl.public.view
     def gap(self, check_id: str) -> int:
-        """How far the published value sits from the threshold, never negative."""
-        c = self._get(check_id)
-        if c.state != S_SETTLED:
-            return 0
-        return int(c.gap)
+        return int(self._get(check_id).gap)
 
     @gl.public.view
     def passes(self, check_id: str) -> bool:
-        """The one question an integrator usually asks. False until settled."""
         c = self._get(check_id)
         return c.state == S_SETTLED and c.verdict == V_SATISFIES
 
     @gl.public.view
     def list_checks(self) -> list:
         out = []
-        for check_id in list(self.checks.keys()):
+        for check_id in self.checks:
             if len(out) >= MAX_LIST:
                 break
             c = self.checks[check_id]
             out.append({
                 "id": check_id,
                 "topic": c.topic,
+                "op": c.op,
+                "threshold": int(c.threshold),
                 "state": c.state,
                 "verdict": c.verdict,
                 "gap": int(c.gap),
@@ -654,6 +746,7 @@ class TermGate(gl.Contract):
             "max_rule": "MAX: satisfied when value <= threshold",
             "gap_rule": "gap is the distance to the threshold, never negative; the verdict gives the side",
             "unit_rule": "a value in a different unit is never converted, it is UNCOMPARABLE",
+            "evidence_rule": "a stored value, unit and verdict must all be printed in the quoted sentence, and every validator re-derives them from its own fetch",
             "model_rule": "the model transcribes a number and a sentence, the contract decides",
             "min_threshold": MIN_THRESHOLD,
             "max_threshold": MAX_THRESHOLD,
