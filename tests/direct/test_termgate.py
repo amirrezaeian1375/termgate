@@ -47,6 +47,11 @@ MONTH_QUOTE = "Either party may decline to renew on one (1) month written notice
 SUPPORT_QUOTE = "We answer support requests within 5 business days."
 
 LLM_PATTERN = r"(?s).*You transcribe one published value.*"
+# Only matches a prompt that actually carries the notice clause, so a window
+# that missed the section produces no reading at all.
+CLAUSE_IN_PROMPT = (
+    r"(?s).*Either party may terminate this Agreement on 30 days written notice.*"
+)
 WEB_PATTERN = r".*example\.com.*"
 
 
@@ -654,7 +659,7 @@ def test_inputs_are_validated(contract):
     assert "UNKNOWN_UNIT" in str(caught.value)
 
     with pytest.raises(Exception) as caught:
-        contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30.5, "DAYS")
+        contract.open_check(URL, "NOTICE_PERIOD", "MIN", 10001, "DAYS")
     assert "THRESHOLD_INVALID" in str(caught.value)
 
 
@@ -710,16 +715,17 @@ def test_rules_are_published(contract):
 def test_the_field_is_found_deep_inside_a_long_page(
     direct_vm, direct_deploy, direct_alice
 ):
-    """A clause past 20000 characters of notice heavy filler must still be read.
+    """A clause past 20000 characters of unrelated text must still be read.
 
-    The mocked model only answers when the clause is actually inside the prompt,
-    so a window that missed the section produces no reading at all.
+    The filler deliberately avoids the words that select the window, so a window
+    picked by position alone would land on the wrong stretch. The mocked model
+    only answers when the clause is actually inside the prompt.
     """
     filler = (
-        "This paragraph talks about notice, notice periods and notices of all "
-        "kinds without ever stating a period that ends this agreement. "
+        "Shipping, invoices and account correspondence are handled in the order "
+        "received. "
     )
-    padding = filler * 260
+    padding = filler * 400
     assert len(padding) > 20000
     long_page = (
         "Example Cloud Terms of Service\n"
@@ -730,16 +736,10 @@ def test_the_field_is_found_deep_inside_a_long_page(
         + padding
     )
 
-    def model_that_needs_the_clause(prompt):
-        body = json.dumps(NOTICE) if NOTICE_QUOTE in prompt else json.dumps(
-            {"value": 0, "unit": "OTHER", "quote": ""}
-        )
-        return body
-
     direct_vm.sender = direct_alice
     direct_vm.clear_mocks()
     direct_vm.mock_web(WEB_PATTERN, {"status": 200, "body": long_page})
-    direct_vm.mock_llm(LLM_PATTERN, model_that_needs_the_clause)
+    direct_vm.mock_llm(CLAUSE_IN_PROMPT, _llm(NOTICE))
     contract = direct_deploy("contracts/termgate.py")
 
     check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
