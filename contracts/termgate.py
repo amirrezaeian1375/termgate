@@ -446,11 +446,12 @@ def _decide(url: str, excerpt: str, topic: str, page: str, op: str, threshold: i
             "unit": U_UNKNOWN,
             "quote": "",
         }
-    if not _unit_ok(found["quote"], found["unit"]):
-        # A stored unit that the citing sentence never prints is not evidence,
-        # so the reading is refused instead of being stored next to a verdict it
-        # cannot justify. This applies to UNKNOWN too: a period counted in
-        # business days has to say so in the sentence that was quoted.
+    if found["unit"] in UNITS and not _unit_ok(found["quote"], found["unit"]):
+        # A stored unit that the citing sentence never prints is not evidence, so
+        # the reading is refused instead of being stored next to a verdict it
+        # cannot justify. UNKNOWN is exempt because it can only ever settle as
+        # UNCOMPARABLE, where the stored unit says nothing about a comparison
+        # that did not happen.
         return {
             "state": S_UNRESOLVED,
             "verdict": "",
@@ -630,9 +631,9 @@ class TermGate(gl.Contract):
                 unit = _as_text(claimed.get("unit"))
                 if not isinstance(value, int) or isinstance(value, bool):
                     return False
-                # A unit outside the published vocabulary is not a claim this
-                # contract can check, so it cannot be accepted.
-                if unit not in UNITS:
+                # A unit outside the published vocabulary and outside UNKNOWN is
+                # not a claim this contract can check, so it cannot be accepted.
+                if unit not in UNITS and unit != U_UNKNOWN:
                     return False
                 # A settled answer spends its evidence four times: the sentence
                 # must be in this validator's own copy of the page, it must
@@ -642,7 +643,7 @@ class TermGate(gl.Contract):
                     return False
                 if not _quote_supports(quote, value, topic):
                     return False
-                if not _unit_ok(quote, unit):
+                if unit in UNITS and not _unit_ok(quote, unit):
                     return False
 
             # The validator re-runs the whole pipeline on its own fetch. Its own
