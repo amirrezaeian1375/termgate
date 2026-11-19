@@ -120,25 +120,25 @@ def test_max_fails_above_the_threshold(contract):
 def test_the_same_page_gives_three_different_verdicts(
     direct_vm, direct_deploy, direct_alice
 ):
-    """The verdict is arithmetic over one reading, not three model opinions."""
-    contract = _contract(direct_vm, direct_deploy, direct_alice, NOTICE)
+    """One page, three requirements, three answers, one fetch each."""
+    direct_vm.sender = direct_alice
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(WEB_PATTERN, {"status": 200, "body": PAGE})
+    direct_vm.mock_llm(LLM_PATTERN, _llm(NOTICE))
+    contract = direct_deploy("contracts/termgate.py")
 
     strict = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
-    exact = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
-    cap = contract.open_check(URL, "NOTICE_PERIOD", "MAX", 14, "DAYS")
-    for check_id in (strict, exact, cap):
+    equal = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    capped = contract.open_check(URL, "NOTICE_PERIOD", "MAX", 14, "DAYS")
+    for check_id in (strict, equal, capped):
         contract.resolve(check_id)
 
-    assert contract.verdict(strict) == "FAILS"
-    assert contract.gap(strict) == 15
-    assert contract.verdict(exact) == "SATISFIES"
-    assert contract.gap(exact) == 0
-    assert contract.verdict(cap) == "FAILS"
-    assert contract.gap(cap) == 16
-
-    # One reading was stored three times, and one page read produced it.
-    assert contract.get_check(strict)["value"] == 30
-    assert contract.get_check(cap)["value"] == 30
+    assert contract.get_check(strict)["verdict"] == "FAILS"
+    assert contract.get_check(strict)["gap"] == 15
+    assert contract.get_check(equal)["verdict"] == "SATISFIES"
+    assert contract.get_check(equal)["gap"] == 0
+    assert contract.get_check(capped)["verdict"] == "FAILS"
+    assert contract.get_check(capped)["gap"] == 16
 
 
 def test_a_different_unit_is_never_converted(
@@ -247,12 +247,12 @@ def test_a_quote_that_is_not_on_the_page_is_rejected(
 def test_a_quote_that_prints_another_number_is_rejected(
     direct_vm, direct_deploy, direct_alice
 ):
-    """The sentence is real and on topic, but it says 30, not 60."""
+    """The sentence is real, but it does not print the number stored beside it."""
     contract = _contract(
         direct_vm,
         direct_deploy,
         direct_alice,
-        _reading(60, "DAYS", NOTICE_QUOTE),
+        _reading(45, "DAYS", NOTICE_QUOTE),
     )
     check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
     contract.resolve(check_id)
@@ -499,120 +499,254 @@ def test_validator_rejects_a_different_reason(contract, direct_vm):
     assert direct_vm.run_validator(leader_result=forged) is False
 
 
+def test_validator_rejects_a_forged_unit(contract, direct_vm):
+    """The steward's case: the numbers are right, the stored unit is not.
+
+    The leader read 30 days, which fails a MIN 45 check by 15. It then stores the
+    same verdict with a unit of MONTHS. Every other field matches, so a comparison
+    that omits the unit would accept a record whose stored unit contradicts the
+    sentence it cites.
+    """
+    contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
+    contract.resolve("C1")
+
+    forged = {
+        "state": "SETTLED",
+        "verdict": "FAILS",
+        "reason": "BELOW_THRESHOLD",
+        "gap": 15,
+        "value": 30,
+        "unit": "MONTHS",
+        "quote": NOTICE_QUOTE,
+    }
+    assert direct_vm.run_validator(leader_result=forged) is False
+
+
+def test_validator_rejects_an_unknown_unit(contract, direct_vm):
+    """A unit outside the vocabulary is not a claim anyone can check."""
+    contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    contract.resolve("C1")
+
+    forged = {
+        "state": "SETTLED",
+        "verdict": "SATISFIES",
+        "reason": "",
+        "gap": 0,
+        "value": 30,
+        "unit": "BUSINESS_DAYS",
+        "quote": NOTICE_QUOTE,
+    }
+    assert direct_vm.run_validator(leader_result=forged) is False
+
+
+def test_a_unit_the_sentence_never_prints_is_not_a_reading(
+    direct_vm, direct_deploy, direct_alice
+):
+    """A days sentence relabelled as months loses its own evidence."""
+    contract = _contract(
+        direct_vm,
+        direct_deploy,
+        direct_alice,
+        _reading(30, "MONTHS", NOTICE_QUOTE),
+    )
+    check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 2, "MONTHS")
+    contract.resolve(check_id)
+
+    data = contract.get_check(check_id)
+    assert data["state"] == "UNRESOLVED"
+    assert data["reason"] == "QUOTE_NOT_SUPPORTING"
+    assert data["unit"] == "UNKNOWN"
+    assert contract.passes(check_id) is False
+
+
+def test_an_uncomparable_unit_is_still_stored_with_its_sentence(
+    direct_vm, direct_deploy, direct_alice
+):
+    """Business days read honestly: the refusal is stored, not thrown away.
+
+    The check settles as UNCOMPARABLE rather than disappearing, because the
+    sentence the page printed is part of the answer the caller asked for.
+    """
+    business_days_page = PAGE.replace(
+        "on 30 days written notice", "on 10 business days written notice"
+    )
+    quote = (
+        "Either party may terminate this Agreement on 10 business days written "
+        "notice to the other party."
+    )
+    direct_vm.sender = direct_alice
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(WEB_PATTERN, {"status": 200, "body": business_days_page})
+    direct_vm.mock_llm(LLM_PATTERN, _llm({"value": 10, "unit": "OTHER", "quote": quote}))
+    contract = direct_deploy("contracts/termgate.py")
+
+    check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 3, "DAYS")
+    contract.resolve(check_id)
+
+    data = contract.get_check(check_id)
+    assert data["state"] == "SETTLED"
+    assert data["verdict"] == "UNCOMPARABLE"
+    assert data["reason"] == "UNIT_MISMATCH"
+    assert data["unit"] == "UNKNOWN"
+    assert data["quote"] == quote
+
+
+def test_a_validator_that_cannot_read_the_page_does_not_accept_a_settled_claim(
+    contract, direct_vm
+):
+    """If the validator's own read fails, it has nothing to confirm."""
+    contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    contract.resolve("C1")
+
+    claimed = {
+        "state": "SETTLED",
+        "verdict": "SATISFIES",
+        "reason": "",
+        "gap": 0,
+        "value": 30,
+        "unit": "DAYS",
+        "quote": NOTICE_QUOTE,
+    }
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(WEB_PATTERN, {"status": 200, "body": PAGE})
+    direct_vm.mock_llm(LLM_PATTERN, _llm({"value": 0, "unit": "OTHER", "quote": ""}))
+    assert direct_vm.run_validator(leader_result=claimed) is False
+
+
+def test_rules_publish_the_evidence_rule(contract):
+    rules = contract.rules()
+    assert "evidence_rule" in rules
+    assert "unit" in rules["evidence_rule"]
+
+
 # ------------------------------------------------------------- state and api
 
 
 def test_open_is_idempotent_per_check(contract):
     first = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
     second = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
-    other = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
-
-    assert first == "C1"
-    assert second == "C1"
-    assert other == "C2"
+    # A different threshold is a different question, so it is a new record.
+    third = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
+    assert first == second
+    assert third != first
     assert contract.count() == 2
 
 
 def test_inputs_are_validated(contract):
-    with pytest.raises(Exception) as bad_url:
-        contract.open_check("http://example.com/legal", "NOTICE_PERIOD", "MIN", 30, "DAYS")
-    assert "URL_MUST_BE_HTTPS" in str(bad_url.value)
+    with pytest.raises(Exception) as caught:
+        contract.open_check("http://example.com", "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    assert "URL_MUST_BE_HTTPS" in str(caught.value)
 
-    with pytest.raises(Exception) as bad_topic:
-        contract.open_check(URL, "ANY_TERM", "MIN", 30, "DAYS")
-    assert "UNKNOWN_TOPIC" in str(bad_topic.value)
+    with pytest.raises(Exception) as caught:
+        contract.open_check(URL, "SHIPPING", "MIN", 30, "DAYS")
+    assert "UNKNOWN_TOPIC" in str(caught.value)
 
-    with pytest.raises(Exception) as bad_op:
+    with pytest.raises(Exception) as caught:
         contract.open_check(URL, "NOTICE_PERIOD", "AT_LEAST", 30, "DAYS")
-    assert "UNKNOWN_OPERATOR" in str(bad_op.value)
+    assert "UNKNOWN_OPERATOR" in str(caught.value)
 
-    with pytest.raises(Exception) as bad_threshold:
+    with pytest.raises(Exception) as caught:
         contract.open_check(URL, "NOTICE_PERIOD", "MIN", 0, "DAYS")
-    assert "THRESHOLD_INVALID" in str(bad_threshold.value)
+    assert "THRESHOLD_INVALID" in str(caught.value)
 
-    with pytest.raises(Exception) as bad_unit:
+    with pytest.raises(Exception) as caught:
         contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "WEEKS")
-    assert "UNKNOWN_UNIT" in str(bad_unit.value)
+    assert "UNKNOWN_UNIT" in str(caught.value)
+
+    with pytest.raises(Exception) as caught:
+        contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30.5, "DAYS")
+    assert "THRESHOLD_INVALID" in str(caught.value)
 
 
 def test_unknown_check_reverts(contract):
     with pytest.raises(Exception) as caught:
-        contract.verdict("C99")
+        contract.get_check("C99")
     assert "UNKNOWN_CHECK" in str(caught.value)
 
 
 def test_resolve_bumps_the_version(contract):
     check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    assert contract.get_check(check_id)["version"] == 0
     contract.resolve(check_id)
+    assert contract.get_check(check_id)["version"] == 1
     contract.resolve(check_id)
     assert contract.get_check(check_id)["version"] == 2
 
 
 def test_passes_is_false_until_settled_and_true_only_for_satisfies(contract):
-    pending = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
-    assert contract.passes(pending) is False
-
-    contract.resolve(pending)
-    assert contract.passes(pending) is True
-
-    failing = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
-    contract.resolve(failing)
-    assert contract.passes(failing) is False
-    assert contract.verdict(failing) == "FAILS"
+    strict = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
+    equal = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    assert contract.passes(strict) is False
+    contract.resolve(strict)
+    contract.resolve(equal)
+    assert contract.passes(strict) is False
+    assert contract.passes(equal) is True
 
 
 def test_list_checks_shows_the_field_and_verdict(contract):
-    check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
-    contract.resolve(check_id)
-
-    listed = contract.list_checks()
-    assert len(listed) == 1
-    assert listed[0]["id"] == check_id
-    assert listed[0]["topic"] == "NOTICE_PERIOD"
-    assert listed[0]["verdict"] == "SATISFIES"
-    assert listed[0]["gap"] == 0
+    contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
+    contract.resolve("C1")
+    rows = contract.list_checks()
+    assert len(rows) == 1
+    assert rows[0]["id"] == "C1"
+    assert rows[0]["topic"] == "NOTICE_PERIOD"
+    assert rows[0]["op"] == "MIN"
+    assert rows[0]["verdict"] == "SATISFIES"
 
 
 def test_rules_are_published(contract):
     rules = contract.rules()
-    assert "SATISFIES" in rules["verdicts"]
+    assert rules["operators"] == ["MIN", "MAX"]
+    assert "DAYS" in rules["units"]
     assert "NOTICE_PERIOD" in rules["topics"]
-    assert rules["units"] == ["DAYS", "MONTHS"]
-    assert rules["max_threshold"] == 10000
-    assert "never converted" in rules["unit_rule"]
+    assert "UNCOMPARABLE" in rules["verdicts"]
+    assert rules["min_threshold"] == 1
+    assert rules["max_value"] == 10000
 
 
-# ---------------------------------------------------------------- long pages
-
-
-LONG_PAGE = (
-    "4. Notices and general correspondence. We may send you a message about your "
-    "account, and replies are handled in the order received. " * 260
-    + "\n12. Term and Termination\n"
-    + NOTICE_QUOTE
-    + "\n13. Miscellaneous. " + "Standard provisions apply. " * 400
-)
+# ------------------------------------------------------ long page behaviour
 
 
 def test_the_field_is_found_deep_inside_a_long_page(
     direct_vm, direct_deploy, direct_alice
 ):
+    """A clause past 20000 characters of notice heavy filler must still be read.
+
+    The mocked model only answers when the clause is actually inside the prompt,
+    so a window that missed the section produces no reading at all.
+    """
+    filler = (
+        "This paragraph talks about notice, notice periods and notices of all "
+        "kinds without ever stating a period that ends this agreement. "
+    )
+    padding = filler * 260
+    assert len(padding) > 20000
+    long_page = (
+        "Example Cloud Terms of Service\n"
+        + padding
+        + "\n12. Term and Termination\n"
+        + "Either party may terminate this Agreement on 30 days written notice "
+        + "to the other party.\n"
+        + padding
+    )
+
+    def model_that_needs_the_clause(prompt):
+        body = json.dumps(NOTICE) if NOTICE_QUOTE in prompt else json.dumps(
+            {"value": 0, "unit": "OTHER", "quote": ""}
+        )
+        return body
+
     direct_vm.sender = direct_alice
     direct_vm.clear_mocks()
-    direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": LONG_PAGE})
-    # This mock only answers if the clause reached the prompt, so a regression
-    # in window selection fails the test instead of passing silently.
-    direct_vm.mock_llm(
-        r"(?s).*Either party may terminate this Agreement on 30 days written notice.*",
-        _llm(NOTICE),
-    )
+    direct_vm.mock_web(WEB_PATTERN, {"status": 200, "body": long_page})
+    direct_vm.mock_llm(LLM_PATTERN, model_that_needs_the_clause)
     contract = direct_deploy("contracts/termgate.py")
 
-    assert len(LONG_PAGE) > 20000
-    check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 45, "DAYS")
+    check_id = contract.open_check(URL, "NOTICE_PERIOD", "MIN", 30, "DAYS")
     contract.resolve(check_id)
 
     data = contract.get_check(check_id)
     assert data["state"] == "SETTLED"
+    assert data["verdict"] == "SATISFIES"
     assert data["value"] == 30
-    assert data["verdict"] == "FAILS"
+    assert data["quote"] == NOTICE_QUOTE
