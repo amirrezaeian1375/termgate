@@ -58,12 +58,14 @@ question is the caller's, and the answer is arithmetic.
 * **A settled answer spends its evidence twice.** Every validator re fetches the
   page itself and then requires: (1) the cited sentence exists on that fresh
   copy; (2) the sentence prints the exact number stored beside it; (3) the
-  sentence contains a keyword for the field being read. A borrowed sentence
-  fails, a real sentence carrying a different figure fails, a sentence about the
-  wrong clause fails.
+  sentence contains a keyword for the field being read; (4) when the stored unit
+  is `DAYS` or `MONTHS`, the sentence prints that unit as a whole word. A
+  borrowed sentence fails, a real sentence carrying a different figure fails, a
+  sentence about the wrong clause fails, and a leader that stores `30 MONTHS`
+  beside a sentence reading `30 days` fails.
 * **The validator then re runs the whole pipeline** and requires an identical
-  state, verdict, gap, reason, and value. A disagreement is a no vote, not a
-  stored guess.
+  state, verdict, gap, reason, value, and unit. A disagreement is a no vote, not
+  a stored guess.
 * **A failure cannot become a pass.** A page with no clause, an ungrounded
   quote, or an unreadable source is stored as `UNRESOLVED` with a reason. Only
   `SATISFIES` makes `passes(id)` true.
@@ -114,27 +116,70 @@ validate a request before writing one.
 
 ## Tests
 
-33 direct mode tests, all passing. `genvm-lint check` clean, 9 methods (2 write,
+39 direct mode tests, all passing. `genvm-lint check` clean, 9 methods (2 write,
 7 view). They cover the decision layer on both operators, the unit mismatch
 refusal, threshold and url validation, idempotent opening, a page whose clause
-sits past 20000 characters of notice heavy text (where the mocked model only
-answers if the clause actually reached the prompt), a quote borrowed from another
-clause, a quote that exists but prints a different number, a quote that is off
-topic, two injection attempts in the page, a validator that must reject a leader
-whose verdict, gap, quote, or reason differs, and a re resolve that bumps
-`version`.
+sits past 20000 characters of filler (where the mocked model only answers if the
+clause actually reached the prompt), a quote borrowed from another clause, a
+quote that exists but prints a different number, a quote that is off topic, a
+quote that prints the number but not the stored unit, two injection attempts in
+the page, a validator that must reject a leader whose verdict, gap, quote,
+reason, or unit differs, a validator that must reject a unit outside the accepted
+vocabulary, a validator that cannot fetch the page and so must not accept a
+settled claim, and a re resolve that bumps `version`.
+
+## What changed after review
+
+The first submission stored a unit beside every value but let a validator settle
+a record without binding that unit to the evidence. `_decide` returned it,
+`_same_verdict` compared state, verdict, reason, gap, and value, and no check
+required the quoted sentence to print the unit it was stored with. A leader could
+keep `30 MONTHS` next to a sentence that reads `30 days` and every validator that
+agreed on the other fields would vote yes.
+
+That is closed in the consensus path, not in the docs:
+
+* `UNIT_WORDS` and `_unit_ok(quote, unit)` match the stored unit as a whole word
+  inside the cited sentence, allowing only short punctuation tails such as
+  `days'` or `days.`.
+* `_decide` refuses to settle a `DAYS` or `MONTHS` reading whose sentence does
+  not print that unit, and stores `QUOTE_NOT_SUPPORTING` instead.
+* `_same_verdict` compares the unit along with the state, verdict, reason, gap,
+  and value.
+* The validator settles only when the unit is in the accepted vocabulary,
+  requires its own fetch of the page to print that unit inside the quoted
+  sentence, and then requires its re-run to match it.
+* `rules()` publishes the obligation as `evidence_rule`, so a caller can read the
+  rule from the contract rather than from the source.
+
+`test_validator_rejects_a_forged_unit` resolves a real check to `FAILS`, gap 15,
+value 30, unit `DAYS`, then re-runs the validator with the same leader result and
+the unit changed to `MONTHS`. The validator returns false.
+`test_validator_rejects_an_unknown_unit` does the same with `BUSINESS_DAYS`, and
+`test_a_unit_the_sentence_never_prints_is_not_a_reading` covers the leader side,
+where such a reading is stored as `UNRESOLVED` with `QUOTE_NOT_SUPPORTING`.
+
+`UNKNOWN` stays exempt on purpose. A page that states a period in business days or
+weeks is an honest `UNCOMPARABLE` and can only ever settle that way, so demanding
+a day or month word there would turn a valid refusal into `UNRESOLVED`. The
+forgery risk lives in `DAYS` and `MONTHS`, and that is where the binding applies.
+
+Because the change alters what validators accept, the contract was redeployed and
+all three demo checks were resolved again. The address and transactions below
+belong to the fixed source, and the code carried by the deployment transaction is
+the code in this repository.
 
 ## Proof on chain
 
 ```
-contract      0x266AFc5b6ab20B73091891723A678B78AF540008
-deploy tx     0xe9b61cca1ab6d22600fa5c512d612dc4c1b92f4022c48c3ff3e43e901815f603  FINALIZED, MAJORITY_AGREE
-open C1       0xe790bde3ac321c06a64592f127de813d9cf6802613b4af4122effd9f1d4cbcee  C1
-resolve C1    0xa9092b688e64710295502ca87301b45e39e1295481240f74226af2600d9d54f0  SETTLED, FAILS, gap 15
-open C2       0xdc4637e4fa886e146fd85f480fe662b960cb1d60c084dda7b03fbbfc7631a4ec  C2
-resolve C2    0xa6e6de323bd92930317fdc0b8d4ce0e68ca5098baa85fe7e9ce65ae74c65dfee  SETTLED, SATISFIES, gap 0
-open C3       0x2c96c4ee3648ec46b8c798414c573c53b84cdf54681988be19e5cb3b84933b41  C3
-resolve C3    0x10933596643992e13e2b7efd2508184377f0fca06124ae38ef438df7844a624b  SETTLED, FAILS, gap 16
+contract      0xe6aF0ad8e98bdfE3407eF2FF654d7a87449d4C18
+deploy tx     0x7c2db42b1e99e8d1b126cda3cc6a0035d16ae1342bcf8eaf330872beb1ab0521  FINALIZED, MAJORITY_AGREE
+open C1       0x8a0dae76d8c6053a240dbf8f06aaa1660ab724ff21095c5a8da4a9be34a2578b  C1
+resolve C1    0x3ed2af6ec76fbc9e9c77242ac7e5bd15cab99e8764bd61355e4b3ba55c6f8d1d  SETTLED, FAILS, gap 15
+open C2       0x8573614c4d9c5f038cd125e4bf7a395318e3d76b55b0274bd0907fedd5777269  C2
+resolve C2    0xe55f5692e75b45b6ed61219709313b5214f13a01a958dc7ea96b7af88f00b516  SETTLED, SATISFIES, gap 0
+open C3       0xa3199a4a4ed741d9952efe659f0c16afd6c1587dee97daa95735d25b33db9cf9  C3
+resolve C3    0xb359a07413fb8c3e280004b17bd2f44f2f65ed0c5153959a6d73360ecb3911f9  SETTLED, FAILS, gap 16
 ```
 
 All seven transactions are FINALIZED with MAJORITY_AGREE. The stored quote on
