@@ -24,7 +24,7 @@ A check is idempotent per tuple: opening the same page, field, operator, thresho
 
 ## Live proof
 
-Deployed on GenLayer Studio, contract `0x266AFc5b6ab20B73091891723A678B78AF540008`, deployment transaction `0xe9b61cca1ab6d22600fa5c512d612dc4c1b92f4022c48c3ff3e43e901815f603` (FINALIZED, MAJORITY_AGREE).
+Deployed on GenLayer Studio, contract `0xe6aF0ad8e98bdfE3407eF2FF654d7a87449d4C18`, deployment transaction `0x7c2db42b1e99e8d1b126cda3cc6a0035d16ae1342bcf8eaf330872beb1ab0521` (FINALIZED, MAJORITY_AGREE).
 
 One clause on the Hetzner terms page: "The contract may be terminated by either party with 30 days' notice to the end of the month, without specifying any reasons."
 
@@ -38,13 +38,13 @@ Each row is two write transactions, and every one of them finished FINALIZED wit
 
 | Step | Transaction |
 |---|---|
-| deploy | `0xe9b61cca1ab6d22600fa5c512d612dc4c1b92f4022c48c3ff3e43e901815f603` |
-| open `C1` | `0xe790bde3ac321c06a64592f127de813d9cf6802613b4af4122effd9f1d4cbcee` |
-| resolve `C1` | `0xa9092b688e64710295502ca87301b45e39e1295481240f74226af2600d9d54f0` |
-| open `C2` | `0xdc4637e4fa886e146fd85f480fe662b960cb1d60c084dda7b03fbbfc7631a4ec` |
-| resolve `C2` | `0xa6e6de323bd92930317fdc0b8d4ce0e68ca5098baa85fe7e9ce65ae74c65dfee` |
-| open `C3` | `0x2c96c4ee3648ec46b8c798414c573c53b84cdf54681988be19e5cb3b84933b41` |
-| resolve `C3` | `0x10933596643992e13e2b7efd2508184377f0fca06124ae38ef438df7844a624b` |
+| deploy | `0x7c2db42b1e99e8d1b126cda3cc6a0035d16ae1342bcf8eaf330872beb1ab0521` |
+| open `C1` | `0x8a0dae76d8c6053a240dbf8f06aaa1660ab724ff21095c5a8da4a9be34a2578b` |
+| resolve `C1` | `0x3ed2af6ec76fbc9e9c77242ac7e5bd15cab99e8764bd61355e4b3ba55c6f8d1d` |
+| open `C2` | `0x8573614c4d9c5f038cd125e4bf7a395318e3d76b55b0274bd0907fedd5777269` |
+| resolve `C2` | `0xe55f5692e75b45b6ed61219709313b5214f13a01a958dc7ea96b7af88f00b516` |
+| open `C3` | `0xa3199a4a4ed741d9952efe659f0c16afd6c1587dee97daa95735d25b33db9cf9` |
+| resolve `C3` | `0xb359a07413fb8c3e280004b17bd2f44f2f65ed0c5153959a6d73360ecb3911f9` |
 
 The same page produces three different verdicts, because the caller set three different requirements. That is the point: the contract answers your question about their text, and it answers it the same way for everyone who asks the same question.
 
@@ -52,12 +52,13 @@ The same page produces three different verdicts, because the caller set three di
 
 The model never sees the threshold and is never asked whether the requirement is met. Its entire job is to transcribe three fields: a number, a unit, and the sentence that prints that number. The comparison, the gap, and the verdict are computed by the contract in integer arithmetic, so any node can reproduce all three without consulting a model.
 
-Before a settled answer is stored, an independent validator does four things on its own fetch of the page:
+Before a settled answer is stored, an independent validator does five things on its own fetch of the page:
 
 1. It requires the cited sentence to exist on the page it fetched itself. A hallucinated or borrowed sentence fails here.
 2. It requires that sentence to print the number stored beside it. A real sentence carrying a different figure fails here.
 3. It requires the sentence to contain a keyword for the field being read, so a number lifted from the wrong clause fails here.
-4. It re-runs the whole read and requires an identical state, verdict, gap, reason, and value.
+4. When the stored unit is `DAYS` or `MONTHS`, it requires the sentence to print that unit as a whole word. A leader that stores `30 MONTHS` beside a sentence that says `30 days` fails here, so the unit is part of the evidence and not a label the leader may pick.
+5. It re-runs the whole read and requires an identical state, verdict, gap, reason, value, and unit.
 
 Only then is the record written. A check that cannot be grounded is stored as `UNRESOLVED` with a reason, never as a pass.
 
@@ -80,7 +81,7 @@ Views:
 | `verdict(check_id)` | Verdict string, empty while pending. |
 | `gap(check_id)` | Non-negative distance to the threshold. |
 | `passes(check_id)` | `true` only for `SATISFIES`. |
-| `list_checks()` | Ids in creation order. |
+| `list_checks()` | Up to 60 records in creation order, each with id, topic, operator, threshold, state, verdict, and gap. |
 | `count()` | Number of checks stored. |
 | `rules()` | The accepted vocabulary and limits, so a client can validate before writing. |
 
@@ -127,7 +128,7 @@ Change the threshold to 30 and the same page satisfies the check. Change the ope
 
 ## Tests
 
-`tests/direct/test_termgate.py` runs 33 tests against the contract with the model and the page fetch stubbed, covering the decision layer, the window selection, grounding and support checks, idempotency, capacity, input validation, and a validator that must reject a leader whose quote is borrowed from another clause.
+`tests/direct/test_termgate.py` runs 39 tests against the contract with the model and the page fetch stubbed, covering the decision layer, the window selection, grounding and support checks, idempotency, capacity, input validation, and a validator that must reject a leader whose quote is borrowed from another clause, whose quote does not print the stored unit, or whose re-run differs in unit.
 
 ```
 pip install -r requirements.txt
